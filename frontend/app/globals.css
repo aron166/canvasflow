@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    @apply h-full bg-obsidian-900 text-slate-200 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+  }
+
+  /* Obsidian scrollbars — the default light ones tear a hole in the dark UI. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full border-2 border-transparent bg-indigo-500/25 bg-clip-content;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-indigo-400/40;
+  }
+
+  *:focus-visible {
+    @apply outline-none ring-2 ring-indigo-400/70 ring-offset-2 ring-offset-obsidian-900;
+  }
+}
+
+@layer components {
+  /* The one surface treatment every panel and node card shares. */
+  .glass {
+    @apply border border-indigo-500/20 bg-obsidian-800/70 backdrop-blur-md;
+  }
+
+  .field {
+    @apply w-full rounded-lg border border-indigo-500/20 bg-obsidian-950/70 px-3 py-2
+           text-sm text-slate-100 placeholder:text-slate-500
+           transition focus:border-indigo-400/60 focus:bg-obsidian-950;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm
+           font-medium transition disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-ghost {
+    @apply btn border border-indigo-500/20 text-slate-300
+           hover:border-indigo-400/40 hover:bg-indigo-500/10 hover:text-white;
+  }
+
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-glow
+           hover:from-indigo-400 hover:to-violet-400;
+  }
+}
+
+/* --- React Flow overrides: strip the light-theme defaults ------------------------- */
+
+.react-flow__attribution {
+  display: none;
+}
+
+.react-flow__node {
+  @apply text-slate-200;
+}
+
+/* The node card owns its own border/shadow, so kill React Flow's selection outline. */
+.react-flow__node.selected .cf-node {
+  @apply border-indigo-400/60 shadow-glow-strong;
+}
+
+.react-flow__handle {
+  @apply h-3 w-3 rounded-full border-2 border-obsidian-900 bg-indigo-400
+         transition hover:scale-125 hover:bg-violet-300;
+  box-shadow: 0 0 10px 1px rgb(129 140 248 / 0.7);
+}
+
+.react-flow__edge-path {
+  stroke: url(#cf-edge-gradient);
+  stroke-width: 2;
+}
+
+.react-flow__edge.selected .react-flow__edge-path,
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke-width: 3;
+  filter: drop-shadow(0 0 6px rgb(129 140 248 / 0.8));
+}
+
+.react-flow__connectionline .react-flow__connection-path {
+  stroke: rgb(129 140 248);
+  stroke-width: 2;
+  stroke-dasharray: 5 5;
+}
+
+.react-flow__controls-button {
+  @apply border-b border-indigo-500/20 bg-obsidian-800/80 fill-slate-300 backdrop-blur-md
+         hover:bg-indigo-500/20 hover:fill-white;
+}
+
+.react-flow__minimap {
+  @apply rounded-xl border border-indigo-500/20 !bg-obsidian-800/70 backdrop-blur-md;
+}
