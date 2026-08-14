@@ -164,17 +164,12 @@ async def resolve_youtube(url: str) -> ResolvedSource:
 
     try:
         raw = await asyncio.to_thread(_fetch)
-    except TranscriptsDisabled as exc:
-        raise IngestError(
-            "This video has transcripts disabled. Download the audio and add it as a "
-            "media source instead."
-        ) from exc
-    except NoTranscriptFound as exc:
-        raise IngestError(
-            "No English transcript is available for this video."
-        ) from exc
     except VideoUnavailable as exc:
         raise IngestError("That video is unavailable (private, deleted, or region-locked).") from exc
+    except (TranscriptsDisabled, NoTranscriptFound):
+        # No published captions. Fall back to downloading the audio and transcribing it
+        # locally — far slower, so it is never the first choice.
+        return await _transcribe_youtube_audio(video_id)
     except Exception as exc:  # noqa: BLE001 - the library raises a wide range
         raise IngestError(f"Could not fetch the transcript: {type(exc).__name__}: {exc}") from exc
 
@@ -203,6 +198,74 @@ async def resolve_youtube(url: str) -> ResolvedSource:
         segments=segments,
         meta={"video_id": video_id, "duration_label": timestamp_label(duration)},
     )
+
+
+async def _transcribe_youtube_audio(video_id: str) -> ResolvedSource:
+    """Last resort for uncaptioned videos: download audio with yt-dlp, run Whisper.
+
+    Costs minutes of CPU where the transcript API costs milliseconds, so this only runs
+    when YouTube publishes no captions at all.
+    """
+    import tempfile
+
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError as exc:
+        raise IngestError(
+            "This video has no published transcript. Transcribing it locally needs "
+            "yt-dlp: pip install yt-dlp faster-whisper"
+        ) from exc
+
+    if not _has_ffmpeg():
+        raise IngestError(
+            "This video has no published transcript, and local transcription needs "
+            "ffmpeg. Install ffmpeg and retry."
+        )
+
+    with tempfile.TemporaryDirectory() as workdir:
+        target = os.path.join(workdir, "audio.%(ext)s")
+
+        def _download() -> str:
+            import yt_dlp
+
+            options = {
+                "format": "bestaudio/best",
+                "outtmpl": target,
+                "quiet": True,
+                "no_warnings": True,
+                "noprogress": True,
+                # Whisper wants mono 16k; ffmpeg does the conversion on extraction.
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "128",
+                    }
+                ],
+            }
+            with yt_dlp.YoutubeDL(options) as downloader:
+                downloader.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+            for name in os.listdir(workdir):
+                if name.startswith("audio."):
+                    return os.path.join(workdir, name)
+            raise IngestError("yt-dlp finished but produced no audio file.")
+
+        try:
+            audio_path = await asyncio.to_thread(_download)
+        except IngestError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - yt-dlp raises many shapes
+            raise IngestError(f"Could not download the audio: {type(exc).__name__}: {exc}") from exc
+
+        resolved = await resolve_media(audio_path, f"YouTube {video_id}")
+
+    resolved.kind = SourceKind.YOUTUBE
+    resolved.title = await _youtube_title(video_id) or f"YouTube {video_id}"
+    resolved.origin = f"https://www.youtube.com/watch?v={video_id}"
+    resolved.meta["video_id"] = video_id
+    resolved.meta["transcript_source"] = "whisper"  # vs YouTube's own captions
+    return resolved
 
 
 async def _youtube_title(video_id: str) -> str | None:

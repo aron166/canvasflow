@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
+  FileInput,
   FileText,
   FlaskConical,
   Loader2,
@@ -21,24 +22,29 @@ import {
   MinusCircle,
   PenLine,
   Play,
+  RotateCcw,
   Sparkles,
   Trash2,
+  UploadCloud,
   Video,
   Wand2,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 
+import { deleteSource, ingestFile, ingestUrl } from "@/lib/api";
 import {
   NODE_PERSONAS,
+  SOURCE_KIND_LABELS,
   type CanvasNodeData,
   type CanvasNodeType,
+  type IngestedSource,
   type NodeRunStatus,
 } from "@/types";
 
 /* --------------------------------------------------------------- accent palette */
 
-type Accent = "indigo" | "violet" | "cyan" | "emerald" | "amber" | "fuchsia";
+type Accent = "indigo" | "violet" | "cyan" | "emerald" | "amber" | "fuchsia" | "sky";
 
 /** Tailwind can't build class names at runtime, so every variant is spelled out. */
 const ACCENTS: Record<Accent, { ring: string; text: string; chip: string; glow: string }> = {
@@ -71,6 +77,12 @@ const ACCENTS: Record<Accent, { ring: string; text: string; chip: string; glow: 
     text: "text-amber-300",
     chip: "bg-amber-500/10 text-amber-200 ring-1 ring-inset ring-amber-400/25",
     glow: "shadow-[0_0_40px_-16px_rgb(245_158_11/0.85)]",
+  },
+  sky: {
+    ring: "border-sky-500/25",
+    text: "text-sky-300",
+    chip: "bg-sky-500/10 text-sky-200 ring-1 ring-inset ring-sky-400/25",
+    glow: "shadow-[0_0_40px_-16px_rgb(14_165_233/0.85)]",
   },
   fuchsia: {
     ring: "border-fuchsia-500/25",
@@ -349,9 +361,270 @@ function NodeShell({
   );
 }
 
+/* ------------------------------------------------------------------ source node */
+
+const ACCEPTED_FILES = ".pdf,.docx,.txt,.md,.csv,.mp3,.mp4,.wav,.m4a,.mov,.webm";
+
+/** Ingestion of an A/V file runs Whisper locally, so the wait is minutes, not seconds. */
+const INGEST_MESSAGES = {
+  link: "Fetching and extracting text…",
+  file: "Transcription and extraction run locally on your machine — audio and video can take several minutes.",
+} as const;
+
+function sourceMetaLine(source: IngestedSource): string {
+  const parts = [`${source.char_count.toLocaleString()} chars`];
+  if (source.meta.duration_label) parts.push(source.meta.duration_label);
+  if (source.meta.pages) parts.push(`${source.meta.pages} pages`);
+  if (source.meta.site) parts.push(source.meta.site);
+  return parts.join(" · ");
+}
+
+function SourceNodeCard({ id, data, selected }: NodeProps & { data: CanvasNodeData }) {
+  const { updateNodeData, deleteElements } = useReactFlow();
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<"link" | "file">("link");
+  const [dragOver, setDragOver] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const accent = ACCENTS.sky;
+
+  const patch = useCallback(
+    (fields: Partial<CanvasNodeData>) => updateNodeData(id, fields),
+    [id, updateNodeData],
+  );
+
+  const run = useCallback(
+    async (ingest: () => Promise<IngestedSource>) => {
+      patch({ ingesting: true, error: undefined });
+      try {
+        patch({ source: await ingest(), ingesting: false });
+      } catch (error) {
+        patch({
+          ingesting: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    [patch],
+  );
+
+  const replace = useCallback(() => {
+    const previous = data.source;
+    // The node moves on regardless; an orphaned server-side source is not worth blocking on.
+    if (previous) void deleteSource(previous.source_id).catch(() => undefined);
+    patch({ source: undefined, url: "", error: undefined });
+    setPreviewOpen(false);
+  }, [data.source, patch]);
+
+  const source = data.source;
+  const url = data.url ?? "";
+
+  return (
+    <div
+      className={`cf-node w-[320px] rounded-2xl border ${accent.ring} bg-obsidian-800/70 backdrop-blur-md
+                  transition-all duration-200 ${accent.glow}
+                  ${selected ? "ring-1 ring-indigo-400/40" : ""}
+                  ${data.ingesting ? "animate-pulse-ring" : ""}`}
+    >
+      {/* Header ------------------------------------------------------------- */}
+      <header className="flex items-start gap-2.5 border-b border-white/5 px-4 py-3">
+        <span className={`mt-0.5 rounded-lg p-1.5 ${accent.chip}`}>
+          <FileInput size={14} />
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <input
+            className="nodrag w-full bg-transparent text-sm font-semibold text-slate-100
+                       outline-none placeholder:text-slate-600"
+            value={data.label}
+            placeholder="Untitled source"
+            onChange={(event) => patch({ label: event.target.value })}
+          />
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            <span className={`text-[10px] uppercase tracking-widest ${accent.text}`}>
+              {source ? SOURCE_KIND_LABELS[source.kind] : "source"}
+            </span>
+            <StatusPill status={data.status} durationMs={data.durationMs} />
+          </div>
+        </div>
+
+        <button
+          type="button"
+          title="Delete node"
+          onClick={() => deleteElements({ nodes: [{ id }] })}
+          className="nodrag rounded-md p-1.5 text-slate-500 transition
+                     hover:bg-rose-500/15 hover:text-rose-300"
+        >
+          <Trash2 size={14} />
+        </button>
+      </header>
+
+      {/* Body --------------------------------------------------------------- */}
+      <div className="space-y-3 px-4 py-3">
+        {data.ingesting ? (
+          <div className="flex items-start gap-2.5 rounded-lg border border-sky-500/20 bg-obsidian-950/60 px-3 py-3">
+            <Loader2 size={14} className={`mt-0.5 shrink-0 animate-spin ${accent.text}`} />
+            <p className="text-xs leading-relaxed text-slate-400">{INGEST_MESSAGES[mode]}</p>
+          </div>
+        ) : source ? (
+          <div className="rounded-lg border border-white/5 bg-obsidian-950/60">
+            <div className="flex items-start gap-2 px-3 py-2.5">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-xs font-medium text-slate-200">{source.title}</p>
+                <p className="truncate text-[10px] text-slate-500">{source.origin}</p>
+                <p className="mt-1 text-[10px] text-slate-500">{sourceMetaLine(source)}</p>
+              </div>
+              <button
+                type="button"
+                title="Replace this source"
+                onClick={replace}
+                className="nodrag rounded-md p-1.5 text-slate-500 transition
+                           hover:bg-sky-500/15 hover:text-sky-200"
+              >
+                <RotateCcw size={13} />
+              </button>
+            </div>
+
+            {source.preview ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setPreviewOpen((open) => !open)}
+                  className="nodrag flex w-full items-center justify-between border-t border-white/5 px-3 py-2
+                             text-[10px] font-semibold uppercase tracking-widest text-slate-400 hover:text-slate-200"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <Sparkles size={11} className={accent.text} />
+                    Preview
+                  </span>
+                  <ChevronDown
+                    size={13}
+                    className={`transition-transform ${previewOpen ? "" : "-rotate-90"}`}
+                  />
+                </button>
+                {previewOpen ? (
+                  <pre className="nowheel max-h-52 overflow-auto whitespace-pre-wrap px-3 pb-3
+                                  text-xs leading-relaxed text-slate-300">
+                    {source.preview}
+                  </pre>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-1 rounded-lg border border-indigo-500/20 bg-obsidian-950/70 p-1">
+              {(["link", "file"] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => setMode(option)}
+                  className={`nodrag flex-1 rounded-md px-2 py-1 text-[11px] font-medium capitalize transition
+                              ${
+                                mode === option
+                                  ? "bg-sky-500/15 text-sky-200"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+
+            {mode === "link" ? (
+              <div className="flex gap-2">
+                <input
+                  className="field nodrag flex-1"
+                  value={url}
+                  placeholder="https://youtube.com/watch?v=…"
+                  onChange={(event) => patch({ url: event.target.value })}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && url.trim()) void run(() => ingestUrl(url.trim()));
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={!url.trim()}
+                  onClick={() => void run(() => ingestUrl(url.trim()))}
+                  className="btn-ghost nodrag shrink-0"
+                >
+                  Ingest
+                </button>
+              </div>
+            ) : (
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => fileInput.current?.click()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") fileInput.current?.click();
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setDragOver(true);
+                }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setDragOver(false);
+                  const file = event.dataTransfer.files[0];
+                  if (file) void run(() => ingestFile(file));
+                }}
+                className={`nodrag flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border
+                            border-dashed px-3 py-5 text-center transition
+                            ${
+                              dragOver
+                                ? "border-sky-400/60 bg-sky-500/10"
+                                : "border-indigo-500/25 bg-obsidian-950/70 hover:border-sky-400/40"
+                            }`}
+              >
+                <UploadCloud size={18} className={accent.text} />
+                <p className="text-xs text-slate-400">Drop a file, or click to browse</p>
+                <p className="text-[10px] text-slate-600">PDF, DOCX, TXT, MD, CSV, audio, video</p>
+                <input
+                  ref={fileInput}
+                  type="file"
+                  className="hidden"
+                  accept={ACCEPTED_FILES}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    // Reset so re-picking the same file still fires a change event.
+                    event.target.value = "";
+                    if (file) void run(() => ingestFile(file));
+                  }}
+                />
+              </div>
+            )}
+          </>
+        )}
+
+        {data.error ? (
+          <p className="rounded-lg bg-rose-500/10 px-3 py-2 text-xs leading-relaxed text-rose-200">
+            {data.error}
+          </p>
+        ) : null}
+
+        {data.retrieval ? (
+          <p
+            className={`rounded-lg px-3 py-2 text-[10px] leading-relaxed ${
+              data.retrieval.strategy === "whole"
+                ? "bg-slate-500/10 text-slate-400"
+                : "bg-amber-500/10 text-amber-200"
+            }`}
+          >
+            {data.retrieval.note}
+          </p>
+        ) : null}
+      </div>
+
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ node types */
 
-const NODE_CONFIGS: Record<CanvasNodeType, ShellConfig> = {
+// `sourceNode` is absent: it ingests rather than generates, so it has its own card.
+const NODE_CONFIGS: Record<Exclude<CanvasNodeType, "sourceNode">, ShellConfig> = {
   campaignInput: {
     icon: Megaphone,
     kind: "campaignInput",
@@ -411,7 +684,12 @@ const NODE_CONFIGS: Record<CanvasNodeType, ShellConfig> = {
  * and blow away focus mid-keystroke.
  */
 export function createNodeTypes(onRunNode: RunNodeHandler) {
-  const entries = (Object.keys(NODE_CONFIGS) as CanvasNodeType[]).map((kind) => {
+  const SourceNode = memo((props: NodeProps) => (
+    <SourceNodeCard {...props} data={props.data as CanvasNodeData} />
+  ));
+  SourceNode.displayName = "sourceNodeNode";
+
+  const entries = (Object.keys(NODE_CONFIGS) as Exclude<CanvasNodeType, "sourceNode">[]).map((kind) => {
     const config = NODE_CONFIGS[kind];
     const Component = memo((props: NodeProps) => (
       <NodeShell
@@ -424,7 +702,7 @@ export function createNodeTypes(onRunNode: RunNodeHandler) {
     Component.displayName = `${kind}Node`;
     return [kind, Component] as const;
   });
-  return Object.fromEntries(entries);
+  return { ...Object.fromEntries(entries), sourceNode: SourceNode };
 }
 
 /** Palette metadata for the "add node" menu in the control bar. */
@@ -434,6 +712,7 @@ export const NODE_CATALOG: readonly {
   icon: LucideIcon;
   accent: Accent;
 }[] = [
+  { type: "sourceNode", label: "Source", icon: FileInput, accent: "sky" },
   { type: "campaignInput", label: "Campaign Input", icon: Megaphone, accent: "amber" },
   { type: "researchNode", label: "Research", icon: FlaskConical, accent: "cyan" },
   { type: "copywriting", label: "Copywriting", icon: PenLine, accent: "indigo" },
@@ -453,5 +732,6 @@ export function defaultNodeData(type: CanvasNodeType): CanvasNodeData {
     persona: "",
     content: "",
     status: "idle",
+    ...(type === "sourceNode" ? { url: "" } : {}),
   };
 }

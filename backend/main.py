@@ -21,16 +21,22 @@ import json
 import os
 import shutil
 import time
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+import ingest
+import retrieval
+from ingest import IngestError, ResolvedSource
+from sources import SourceStore
 
 load_dotenv()
 
@@ -48,6 +54,17 @@ MAX_OUTPUT_TOKENS = 16_000
 # user can specialize a CopywritingNode into "Luxury brand voice" without losing the
 # structural instructions that make the node type useful in a pipeline.
 NODE_SYSTEM_PROMPTS: dict[str, str] = {
+    # Deliberately no sample marker values here: weaker models copy any literal example
+    # straight into their answer as a fabricated citation.
+    "sourceNode": (
+        "You are a source reader. Answer strictly from the provided source material. "
+        "The source has bracketed position markers at the start of lines — timestamps "
+        "for transcripts, page numbers for documents. When you reference something "
+        "specific, cite the marker that actually appears above that line, copied "
+        "exactly. Never invent a marker, and never cite one you cannot see in the "
+        "source. If the source does not contain the answer, say so plainly rather than "
+        "filling the gap from general knowledge."
+    ),
     "campaignInput": (
         "You are a marketing strategist. Take the raw campaign brief you are given and "
         "restate it as a tight, structured brief: audience, core promise, tone, "
@@ -139,6 +156,7 @@ class NodeData(BaseModel):
     persona: str | None = None
     content: str | None = None  # static text the user typed into the node
     output: str | None = None  # last run's result, echoed back for convenience
+    source_id: str | None = None  # set on source nodes; body is loaded at run time
 
 
 class FlowNode(BaseModel):
@@ -172,6 +190,19 @@ class ExecuteWorkflowRequest(BaseModel):
     engine: EngineConfig
 
 
+class RetrievalReport(BaseModel):
+    """How one source's text reached the model — surfaced so an abridged context is
+    visible on the node card rather than silently assumed complete."""
+
+    source_id: str
+    strategy: Literal["whole", "embeddings", "keyword"]
+    used_chars: int
+    total_chars: int
+    chunks_used: int
+    chunks_total: int
+    note: str
+
+
 class NodeResult(BaseModel):
     node_id: str
     status: Literal["ok", "error", "skipped"]
@@ -180,6 +211,7 @@ class NodeResult(BaseModel):
     provider: EngineProvider | None = None
     model: str | None = None
     duration_ms: int = 0
+    retrieval: list[RetrievalReport] | None = None
 
 
 class WorkflowResponse(BaseModel):
@@ -540,8 +572,59 @@ def build_system_prompt(node: FlowNode) -> str:
     return f"{base}\n\nAdopt this persona and voice: {persona}" if persona else base
 
 
-def build_user_prompt(node: FlowNode, upstream_outputs: list[str]) -> str:
+async def build_source_section(
+    node: FlowNode, store: SourceStore, provider: EngineProvider, ollama_url: str
+) -> tuple[str, RetrievalReport | None]:
+    """Loads this node's ingested source and fits it to the engine's context budget.
+
+    Returns the prompt section and a report of how it was assembled — the report is what
+    tells the user whether they got the whole source or a retrieved subset.
+    """
+    source_id = (node.data.source_id or "").strip()
+    if not source_id:
+        return "", None
+
+    record = store.get(source_id)
+    text = store.text(source_id)
+    if record is None or text is None:
+        raise EngineError(
+            "This source is no longer available on the backend — re-ingest it on the node."
+        )
+
+    outcome = await retrieval.assemble_context(
+        source_id=source_id,
+        title=record["title"],
+        # The downstream instruction is the retrieval query: it is what the selected
+        # passages actually need to be relevant to.
+        text=text,
+        query=(node.data.prompt or "").strip() or record["title"],
+        budget_chars=retrieval.context_budget(provider.value),
+        ollama_url=ollama_url,
+    )
+
+    header = f'<source title="{record["title"]}" origin="{record["origin"]}">'
+    section = f"{header}\n{outcome.text}\n</source>"
+
+    report = RetrievalReport(
+        source_id=source_id,
+        strategy=outcome.strategy,  # type: ignore[arg-type]
+        used_chars=outcome.used_chars,
+        total_chars=outcome.total_chars,
+        chunks_used=outcome.chunks_used,
+        chunks_total=outcome.chunks_total,
+        note=outcome.note,
+    )
+    return section, report
+
+
+def build_user_prompt(
+    node: FlowNode, upstream_outputs: list[str], source_section: str = ""
+) -> str:
     sections: list[str] = []
+
+    # Source material leads: everything downstream is reasoning about it.
+    if source_section:
+        sections.append(source_section)
 
     upstream = [text.strip() for text in upstream_outputs if text and text.strip()]
     if upstream:
@@ -558,7 +641,8 @@ def build_user_prompt(node: FlowNode, upstream_outputs: list[str]) -> str:
 
     if not sections:
         raise EngineError(
-            "Nothing to run: this node has no prompt, no content, and no connected input."
+            "Nothing to run: this node has no prompt, no content, no source, and no "
+            "connected input."
         )
     return "\n\n".join(sections)
 
@@ -601,12 +685,19 @@ def topological_order(nodes: list[FlowNode], edges: list[FlowEdge]) -> list[list
 
 
 async def run_node(
-    engine: Engine, node: FlowNode, upstream_outputs: list[str]
+    engine: Engine, node: FlowNode, upstream_outputs: list[str], store: SourceStore
 ) -> NodeResult:
     started = time.monotonic()
+    reports: list[RetrievalReport] = []
+
     try:
         system = build_system_prompt(node)
-        prompt = build_user_prompt(node, upstream_outputs)
+        section, report = await build_source_section(
+            node, store, engine.provider, engine.config.ollama_url
+        )
+        if report is not None:
+            reports.append(report)
+        prompt = build_user_prompt(node, upstream_outputs, section)
         output = await engine.generate(system, prompt)
         status: Literal["ok", "error"] = "ok"
         error = None
@@ -623,6 +714,7 @@ async def run_node(
         provider=engine.provider,
         model=engine.model_name,
         duration_ms=int((time.monotonic() - started) * 1000),
+        retrieval=reports or None,
     )
 
 
@@ -645,6 +737,53 @@ app.add_middleware(
 )
 
 
+STORE = SourceStore()
+
+# Ingestion jobs, in-process. A transcription can run for minutes, so the HTTP request
+# that starts it must not be the thing that waits for it.
+#
+# ponytail: a plain dict, not Celery. Celery buys durability across restarts and
+# multi-machine workers; this is a single-user local tool where a restart means the
+# canvas is reloaded anyway. Swap in a broker only if CanvasFlow ever becomes hosted.
+INGEST_JOBS: dict[str, dict[str, Any]] = {}
+INGEST_SEMAPHORE = asyncio.Semaphore(2)  # transcription is CPU-bound; don't thrash
+
+
+class IngestUrlRequest(BaseModel):
+    url: str
+
+
+class IngestJob(BaseModel):
+    job_id: str
+    state: Literal["queued", "running", "done", "error"]
+    stage: str = ""
+    source: dict[str, Any] | None = None
+    error: str | None = None
+
+
+async def _run_ingest_job(job_id: str, coroutine_factory: Any, label: str) -> None:
+    """Drives one ingestion to completion, recording progress for the poller."""
+    INGEST_JOBS[job_id].update(state="running", stage=f"Processing {label}…")
+    async with INGEST_SEMAPHORE:
+        try:
+            resolved: ResolvedSource = await coroutine_factory()
+            public = STORE.save(resolved)
+            INGEST_JOBS[job_id].update(state="done", stage="Complete", source=public)
+        except IngestError as exc:
+            INGEST_JOBS[job_id].update(state="error", error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - a job must never take the server down
+            INGEST_JOBS[job_id].update(
+                state="error", error=f"Unexpected {type(exc).__name__}: {exc}"
+            )
+
+
+def _start_job(coroutine_factory: Any, label: str) -> IngestJob:
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    INGEST_JOBS[job_id] = {"job_id": job_id, "state": "queued", "stage": "Queued"}
+    asyncio.create_task(_run_ingest_job(job_id, coroutine_factory, label))
+    return IngestJob(**INGEST_JOBS[job_id])
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "canvasflow-engine"}
@@ -659,13 +798,118 @@ async def engine_status(config: EngineConfig) -> EngineStatus:
         return EngineStatus(provider=config.provider, available=False, detail=str(exc))
 
 
+@app.post("/api/sources/ingest")
+async def ingest_url(request: IngestUrlRequest) -> Any:
+    """Ingests a URL.
+
+    YouTube transcripts and web pages resolve in seconds, so they return the finished
+    source directly — the common case stays a single round trip. Anything that has to
+    download or transcribe returns a job to poll instead.
+    """
+    url = request.url.strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"detail": "No URL provided."})
+
+    normalized = url if url.startswith(("http://", "https://")) else f"https://{url}"
+    kind = ingest.classify_url(normalized)
+
+    if kind in (ingest.SourceKind.MEDIA, ingest.SourceKind.DOCUMENT):
+        job = _start_job(lambda: ingest.resolve_url(normalized), kind.value)
+        return JSONResponse(status_code=202, content=job.model_dump())
+
+    try:
+        resolved = await ingest.resolve_url(normalized)
+    except IngestError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    return STORE.save(resolved)
+
+
+@app.post("/api/sources/upload")
+async def upload_source(file: UploadFile = File(...)) -> Any:
+    """Accepts a file upload. Media is transcribed in the background; documents parse
+    fast enough to return inline."""
+    import tempfile
+
+    filename = os.path.basename(file.filename or "upload")
+    suffix = os.path.splitext(filename)[1].lower()
+
+    written = 0
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > ingest.MAX_DOWNLOAD_BYTES:
+                    handle.close()
+                    os.unlink(handle.name)
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"{filename} exceeds the "
+                            f"{ingest.MAX_DOWNLOAD_BYTES // 1024 // 1024} MB limit."
+                        },
+                    )
+                handle.write(chunk)
+            temp_path = handle.name
+    finally:
+        await file.close()
+
+    media_suffixes = {".mp3", ".mp4", ".wav", ".m4a", ".mov", ".webm", ".mkv", ".ogg", ".flac"}
+
+    if suffix in media_suffixes:
+        # The temp file must outlive the request, so the job owns cleanup.
+        async def transcribe() -> ResolvedSource:
+            try:
+                return await ingest.resolve_file(temp_path, filename)
+            finally:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        job = _start_job(transcribe, filename)
+        return JSONResponse(status_code=202, content=job.model_dump())
+
+    try:
+        resolved = await ingest.resolve_file(temp_path, filename)
+    except IngestError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    return STORE.save(resolved)
+
+
+@app.get("/api/sources/jobs/{job_id}", response_model=IngestJob)
+async def ingest_job_status(job_id: str) -> Any:
+    job = INGEST_JOBS.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"detail": "Unknown job."})
+    return IngestJob(**job)
+
+
+@app.get("/api/sources")
+async def list_sources() -> list[dict[str, Any]]:
+    return STORE.list_all()
+
+
+@app.delete("/api/sources/{source_id}")
+async def delete_source(source_id: str) -> Any:
+    if not STORE.delete(source_id):
+        return JSONResponse(status_code=404, content={"detail": "Unknown source."})
+    return {"status": "deleted", "source_id": source_id}
+
+
 @app.post("/api/execute/node", response_model=NodeResult)
 async def execute_node(request: ExecuteNodeRequest) -> NodeResult:
     try:
         engine = build_engine(request.engine)
     except EngineError as exc:
         return NodeResult(node_id=request.node.id, status="error", error=str(exc))
-    return await run_node(engine, request.node, request.upstream_outputs)
+    return await run_node(engine, request.node, request.upstream_outputs, STORE)
 
 
 @app.post("/api/execute/workflow", response_model=WorkflowResponse)
@@ -721,6 +965,7 @@ async def execute_workflow(request: ExecuteWorkflowRequest) -> Any:
                         for p in parents[node.id]
                         if p in results and results[p].status == "ok"
                     ],
+                    STORE,
                 )
                 for node in runnable
             )

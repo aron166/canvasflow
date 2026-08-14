@@ -312,6 +312,8 @@ function CanvasInner() {
           output: result.output,
           error: result.error ?? undefined,
           durationMs: result.duration_ms,
+          // A node has at most one source, so the first report is its report.
+          retrieval: result.retrieval?.[0],
         });
       } catch (error) {
         patchNode(nodeId, {
@@ -353,6 +355,7 @@ function CanvasInner() {
               output: result.output || node.data.output,
               error: result.error ?? undefined,
               durationMs: result.duration_ms,
+              retrieval: result.retrieval?.[0],
             },
           };
         }),
