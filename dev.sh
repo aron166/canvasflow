@@ -38,8 +38,17 @@ fi
 API_PORT="$(find_port 8000)"
 [ "$API_PORT" != "8000" ] && echo "note: port 8000 was busy, using $API_PORT"
 
+# Resolve the web port before starting the API, so the API can be told which origin to
+# accept. Picking it afterwards is what previously left the two disagreeing.
+WEB_PORT="$(find_port 3000)"
+[ "$WEB_PORT" != "3000" ] && echo "note: port 3000 was busy, using $WEB_PORT"
+
 # .venv/bin/uvicorn, never plain `uvicorn` — the system one can't see these deps.
-( cd "$BACKEND" && exec "$BACKEND/.venv/bin/uvicorn" main:app --reload --port "$API_PORT" ) &
+(
+  cd "$BACKEND"
+  CANVASFLOW_ALLOWED_ORIGINS="http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT" \
+    exec "$BACKEND/.venv/bin/uvicorn" main:app --reload --port "$API_PORT"
+) &
 API_PID=$!
 
 # --- frontend -----------------------------------------------------------------------
@@ -48,9 +57,6 @@ if [ ! -d "$FRONTEND/node_modules" ]; then
   echo "Installing frontend dependencies (first run only)…"
   ( cd "$FRONTEND" && npm install )
 fi
-
-WEB_PORT="$(find_port 3000)"
-[ "$WEB_PORT" != "3000" ] && echo "note: port 3000 was busy, using $WEB_PORT"
 
 ( cd "$FRONTEND" && NEXT_PUBLIC_CANVASFLOW_API="http://localhost:$API_PORT" \
     exec npx next dev -p "$WEB_PORT" ) &

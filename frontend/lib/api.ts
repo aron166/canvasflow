@@ -23,9 +23,14 @@ async function send<T>(path: string, init: RequestInit): Promise<T> {
   try {
     response = await fetch(`${API_BASE}${path}`, init);
   } catch {
+    // fetch() reports a CORS rejection and a dead server identically — an opaque
+    // TypeError — so this message has to cover both rather than assert one.
     throw new ApiError(
-      `Cannot reach the CanvasFlow backend at ${API_BASE}. Start it with ` +
-        `\`uvicorn main:app --reload --port 8000\` from the backend/ directory.`,
+      `Could not reach the CanvasFlow backend at ${API_BASE}. Either it isn't running, ` +
+        `or it rejected this page's origin (${
+          typeof window !== "undefined" ? window.location.origin : "unknown"
+        }). Start both halves with ./dev.sh from the project root, and check the ` +
+        `browser console for a CORS error to tell the two apart.`,
     );
   }
 
