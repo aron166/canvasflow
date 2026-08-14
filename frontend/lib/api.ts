@@ -71,6 +71,7 @@ export function toNodePayload(node: CanvasNode): FlowNodePayload {
       persona: node.data.persona,
       content: node.data.content,
       source_id: node.data.source?.source_id,
+      coverage: node.data.coverage,
     },
     position: node.position,
   };

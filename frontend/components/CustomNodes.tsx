@@ -371,13 +371,39 @@ const INGEST_MESSAGES = {
   file: "Transcription and extraction run locally on your machine — audio and video can take several minutes.",
 } as const;
 
-function sourceMetaLine(source: IngestedSource): string {
-  const parts = [`${source.char_count.toLocaleString()} chars`];
-  if (source.meta.duration_label) parts.push(source.meta.duration_label);
-  if (source.meta.pages) parts.push(`${source.meta.pages} pages`);
-  if (source.meta.site) parts.push(source.meta.site);
-  return parts.join(" · ");
+// Split rather than joined into a string so the numbers can carry their own weight —
+// scale is the thing users misread when they only see a 1,200-char preview.
+function sourceStats(source: IngestedSource): { value: string; unit?: string }[] {
+  const stats: { value: string; unit?: string }[] = [
+    { value: source.char_count.toLocaleString(), unit: "chars" },
+  ];
+  if (source.meta.duration_label) stats.push({ value: source.meta.duration_label });
+  if (source.meta.pages) stats.push({ value: String(source.meta.pages), unit: "pages" });
+  if (source.meta.site) stats.push({ value: source.meta.site });
+  return stats;
 }
+
+/** Only offered above this size; below it every strategy reads the whole source anyway. */
+const COVERAGE_THRESHOLD = 20_000;
+
+const COVERAGE_OPTIONS = [
+  {
+    value: "auto",
+    label: "Auto",
+    description: "Picks whole-source when it fits, retrieval when it doesn't.",
+  },
+  {
+    value: "retrieve",
+    label: "Relevant",
+    description: "Fastest; sends only passages matching this node's instruction.",
+  },
+  {
+    value: "full",
+    label: "Complete",
+    description:
+      "Reads the entire source in sequential passes, then synthesises; slowest and costs several model calls.",
+  },
+] as const;
 
 function SourceNodeCard({ id, data, selected }: NodeProps & { data: CanvasNodeData }) {
   const { updateNodeData, deleteElements } = useReactFlow();
@@ -417,6 +443,7 @@ function SourceNodeCard({ id, data, selected }: NodeProps & { data: CanvasNodeDa
 
   const source = data.source;
   const url = data.url ?? "";
+  const coverage = data.coverage ?? "auto";
 
   return (
     <div
@@ -470,8 +497,18 @@ function SourceNodeCard({ id, data, selected }: NodeProps & { data: CanvasNodeDa
             <div className="flex items-start gap-2 px-3 py-2.5">
               <div className="min-w-0 flex-1">
                 <p className="truncate text-xs font-medium text-slate-200">{source.title}</p>
-                <p className="truncate text-[10px] text-slate-500">{source.origin}</p>
-                <p className="mt-1 text-[10px] text-slate-500">{sourceMetaLine(source)}</p>
+                <div className="mt-1 flex flex-wrap items-baseline gap-x-1.5 text-[10px] text-slate-500">
+                  {sourceStats(source).map((stat, index) => (
+                    <span key={stat.value} className="inline-flex items-baseline gap-1">
+                      {index > 0 ? <span className="pr-0.5 text-slate-700">·</span> : null}
+                      <span className="text-xs font-semibold tabular-nums text-slate-100">
+                        {stat.value}
+                      </span>
+                      {stat.unit}
+                    </span>
+                  ))}
+                </div>
+                <p className="mt-1 truncate text-[10px] text-slate-500">{source.origin}</p>
               </div>
               <button
                 type="button"
@@ -492,22 +529,61 @@ function SourceNodeCard({ id, data, selected }: NodeProps & { data: CanvasNodeDa
                   className="nodrag flex w-full items-center justify-between border-t border-white/5 px-3 py-2
                              text-[10px] font-semibold uppercase tracking-widest text-slate-400 hover:text-slate-200"
                 >
-                  <span className="inline-flex items-center gap-1.5">
-                    <Sparkles size={11} className={accent.text} />
-                    Preview
+                  <span className="inline-flex items-center gap-1.5 text-left">
+                    <Sparkles size={11} className={`shrink-0 ${accent.text}`} />
+                    Preview — first {source.preview.length.toLocaleString()} characters of{" "}
+                    {source.char_count.toLocaleString()}
                   </span>
                   <ChevronDown
                     size={13}
-                    className={`transition-transform ${previewOpen ? "" : "-rotate-90"}`}
+                    className={`shrink-0 transition-transform ${previewOpen ? "" : "-rotate-90"}`}
                   />
                 </button>
                 {previewOpen ? (
-                  <pre className="nowheel max-h-52 overflow-auto whitespace-pre-wrap px-3 pb-3
-                                  text-xs leading-relaxed text-slate-300">
-                    {source.preview}
-                  </pre>
+                  <>
+                    <pre className="nowheel max-h-52 overflow-auto whitespace-pre-wrap px-3 pb-2
+                                    text-xs leading-relaxed text-slate-300">
+                      {source.preview}
+                    </pre>
+                    {source.preview.length < source.char_count ? (
+                      <p className="px-3 pb-3 text-[10px] leading-relaxed text-slate-500">
+                        Truncated for display only. The full{" "}
+                        {source.char_count.toLocaleString()} characters are stored on the backend
+                        and reach the AI at run time.
+                      </p>
+                    ) : null}
+                  </>
                 ) : null}
               </>
+            ) : null}
+
+            {source.char_count > COVERAGE_THRESHOLD ? (
+              <div className="border-t border-white/5 px-3 py-2.5">
+                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                  Coverage
+                </p>
+                <div className="flex gap-1 rounded-lg border border-indigo-500/20 bg-obsidian-950/70 p-1">
+                  {COVERAGE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      title={option.description}
+                      onClick={() => patch({ coverage: option.value })}
+                      className={`nodrag flex-1 rounded-md px-2 py-1 text-[11px] font-medium transition
+                                  ${
+                                    coverage === option.value
+                                      ? "bg-sky-500/15 text-sky-200"
+                                      : "text-slate-400 hover:text-slate-200"
+                                  }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+                  {COVERAGE_OPTIONS.find((option) => option.value === coverage)?.description}
+                </p>
+              </div>
             ) : null}
           </div>
         ) : (

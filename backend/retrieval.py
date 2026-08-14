@@ -303,6 +303,36 @@ def context_budget(provider: str) -> int:
     return CONTEXT_BUDGETS.get(provider, DEFAULT_BUDGET)
 
 
+def plan_windows(text: str, budget_chars: int, source_id: str = "w") -> list[str]:
+    """Splits an oversized source into sequential windows that each fit the budget.
+
+    Used by full-coverage mode, where the point is that *every* part of the source is
+    read — so windows are contiguous and ordered, unlike retrieval which cherry-picks.
+    Chunk-level overlap carries context across the seams.
+    """
+    if len(text) <= budget_chars:
+        return [text]
+
+    chunks = chunk_text(text, source_id)
+    windows: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    for chunk in chunks:
+        piece = f"[{chunk.label}]\n{chunk.text}"
+        # A single chunk larger than the budget gets its own window and is hard-cut;
+        # CHUNK_CHARS is well under any real budget, so this is a guard, not a path.
+        if size + len(piece) > budget_chars and current:
+            windows.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(piece)
+        size += len(piece) + 2
+
+    if current:
+        windows.append("\n\n".join(current))
+    return windows
+
+
 async def assemble_context(
     *,
     source_id: str,

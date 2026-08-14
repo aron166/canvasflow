@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -49,6 +50,9 @@ DEFAULT_OLLAMA_MODEL = "llama3"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_OUTPUT_TOKENS = 16_000
+
+# model name -> its maximum context length, read once from Ollama's metadata
+_OLLAMA_CONTEXT_CACHE: dict[str, int] = {}
 
 # Node-type -> baseline system prompt. The node's own `persona` field is appended, so a
 # user can specialize a CopywritingNode into "Luxury brand voice" without losing the
@@ -139,6 +143,15 @@ class EngineConfig(BaseModel):
     # Option C
     ollama_url: str = DEFAULT_OLLAMA_URL
     ollama_model: str = DEFAULT_OLLAMA_MODEL
+    ollama_max_context_tokens: int = Field(
+        default=32_768,
+        description=(
+            "Upper bound on the context window requested from Ollama. Ollama defaults to "
+            "4096 and silently discards anything beyond it, so this is sized per request "
+            "from the actual prompt. Raise for long sources, lower if the machine is "
+            "short on RAM — a large window costs memory even when unused."
+        ),
+    )
 
     # Shared
     temperature: float | None = None
@@ -157,6 +170,7 @@ class NodeData(BaseModel):
     content: str | None = None  # static text the user typed into the node
     output: str | None = None  # last run's result, echoed back for convenience
     source_id: str | None = None  # set on source nodes; body is loaded at run time
+    coverage: Literal["auto", "retrieve", "full"] = "auto"
 
 
 class FlowNode(BaseModel):
@@ -195,7 +209,7 @@ class RetrievalReport(BaseModel):
     visible on the node card rather than silently assumed complete."""
 
     source_id: str
-    strategy: Literal["whole", "embeddings", "keyword"]
+    strategy: Literal["whole", "embeddings", "keyword", "full"]
     used_chars: int
     total_chars: int
     chunks_used: int
@@ -480,15 +494,60 @@ class OllamaEngine(Engine):
     def base_url(self) -> str:
         return (self.config.ollama_url or DEFAULT_OLLAMA_URL).rstrip("/")
 
+    async def _model_context_limit(self) -> int:
+        """The model's own maximum context, from Ollama's metadata.
+
+        Cached per model: it is a fixed property of the weights, and /api/show is a
+        round trip we would otherwise pay on every single node execution.
+        """
+        cached = _OLLAMA_CONTEXT_CACHE.get(self.model_name)
+        if cached is not None:
+            return cached
+
+        limit = 8_192  # a safe floor if the metadata doesn't say
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/show", json={"model": self.model_name}
+                )
+                if response.status_code == 200:
+                    info = response.json().get("model_info", {}) or {}
+                    for key, value in info.items():
+                        if key.endswith(".context_length") and isinstance(value, int):
+                            limit = value
+                            break
+        except Exception:  # noqa: BLE001 - fall back to the floor
+            pass
+
+        _OLLAMA_CONTEXT_CACHE[self.model_name] = limit
+        return limit
+
+    async def _num_ctx_for(self, text: str) -> int:
+        """Sizes the context window to the prompt.
+
+        This is the difference between the model reading the whole source and reading a
+        fragment of it: Ollama's default window is 4096 tokens and it discards the
+        overflow *without any error* — the reply just quietly answers from part of the
+        input.
+        """
+        # ~3.5 chars/token is conservative for English; over-estimating costs a little
+        # RAM, under-estimating silently loses content, so bias upward.
+        needed = int(len(text) / 3.5) + MAX_OUTPUT_TOKENS // 8
+        ceiling = min(await self._model_context_limit(), self.config.ollama_max_context_tokens)
+        return max(4_096, min(needed, ceiling))
+
     async def generate(self, system: str, prompt: str) -> str:
+        options: dict[str, Any] = {"num_ctx": await self._num_ctx_for(system + prompt)}
+        if self.config.temperature is not None:
+            options["temperature"] = self.config.temperature
+
         payload: dict[str, Any] = {
             "model": self.model_name,
             "prompt": prompt,
             "system": system,
             "stream": False,
+            "options": options,
         }
-        if self.config.temperature is not None:
-            payload["options"] = {"temperature": self.config.temperature}
 
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
@@ -572,8 +631,25 @@ def build_system_prompt(node: FlowNode) -> str:
     return f"{base}\n\nAdopt this persona and voice: {persona}" if persona else base
 
 
+async def engine_context_budget(engine: Engine) -> int:
+    """Characters of source material this engine can actually take in one call.
+
+    For Ollama this is derived from the model's real context length rather than a fixed
+    guess — an 8k model and a 128k model should not be handed the same amount.
+    """
+    if isinstance(engine, OllamaEngine):
+        limit = min(
+            await engine._model_context_limit(),  # noqa: SLF001 - same module
+            engine.config.ollama_max_context_tokens,
+        )
+        # Leave room for the system prompt, the instruction, and the reply.
+        usable_tokens = max(2_048, limit - MAX_OUTPUT_TOKENS // 8 - 1_024)
+        return int(usable_tokens * 3.5)
+    return retrieval.context_budget(engine.provider.value)
+
+
 async def build_source_section(
-    node: FlowNode, store: SourceStore, provider: EngineProvider, ollama_url: str
+    node: FlowNode, store: SourceStore, engine: Engine, budget_chars: int
 ) -> tuple[str, RetrievalReport | None]:
     """Loads this node's ingested source and fits it to the engine's context budget.
 
@@ -598,8 +674,8 @@ async def build_source_section(
         # passages actually need to be relevant to.
         text=text,
         query=(node.data.prompt or "").strip() or record["title"],
-        budget_chars=retrieval.context_budget(provider.value),
-        ollama_url=ollama_url,
+        budget_chars=budget_chars,
+        ollama_url=engine.config.ollama_url,
     )
 
     header = f'<source title="{record["title"]}" origin="{record["origin"]}">'
@@ -684,6 +760,122 @@ def topological_order(nodes: list[FlowNode], edges: list[FlowEdge]) -> list[list
     return levels
 
 
+_EMPTY_SENTINEL = "NOTHING RELEVANT"
+
+
+def _is_empty_finding(result: str) -> bool:
+    """True when a pass genuinely found nothing.
+
+    The sentinel phrase also appears in the instruction we send, and small models echo
+    their instructions — so a substring match discards real findings. A pass only counts
+    as empty when the sentinel is essentially the *entire* reply.
+    """
+    stripped = result.strip()
+    if not stripped:
+        return True
+    if _EMPTY_SENTINEL not in stripped.upper():
+        return False
+    # Everything except the sentinel and punctuation — if little remains, it's a no-op.
+    remainder = re.sub(
+        _EMPTY_SENTINEL, "", stripped, flags=re.IGNORECASE
+    ).strip(" .,:;!-—\"'\n\t")
+    return len(remainder) < 40
+
+
+async def run_full_coverage(
+    engine: Engine,
+    node: FlowNode,
+    upstream_outputs: list[str],
+    text: str,
+    title: str,
+    budget: int,
+) -> tuple[str, RetrievalReport]:
+    """Reads the entire source in sequential passes, then synthesises one answer.
+
+    Retrieval answers "what in this source is relevant to my question"; this answers
+    "what does the whole source say", which is the only correct mode for tasks like
+    summarising an hour-long video or auditing a long document for every occurrence of
+    something. It costs one model call per window plus one to combine.
+    """
+    windows = retrieval.plan_windows(text, budget, node.data.source_id or "w")
+    instruction = (node.data.prompt or "").strip() or f"Summarise this part of {title}."
+    system = build_system_prompt(node)
+
+    async def read_window(index: int, window: str) -> str:
+        pass_prompt = (
+            f'<source title="{title}" part="{index + 1} of {len(windows)}">\n{window}\n</source>\n\n'
+            f"<task>\nThis is part {index + 1} of {len(windows)} of a longer source. "
+            f"Extract everything in THIS PART that is relevant to the following "
+            f"instruction, keeping the bracketed position markers on anything you quote. "
+            f"If this part contains nothing relevant, reply exactly: NOTHING RELEVANT.\n\n"
+            f"{instruction}\n</task>"
+        )
+        return await engine.generate(system, pass_prompt)
+
+    # Sequential rather than concurrent: a local model serves one request at a time
+    # anyway, and firing N at once just queues them while multiplying peak RAM.
+    findings: list[str] = []
+    empty_passes = 0
+    for index, window in enumerate(windows):
+        try:
+            result = (await read_window(index, window)).strip()
+        except EngineError as exc:
+            result = f"(part {index + 1} failed: {exc})"
+
+        if _is_empty_finding(result):
+            empty_passes += 1
+            continue
+        findings.append(f"--- from part {index + 1} of {len(windows)} ---\n{result}")
+
+    if not findings:
+        raise EngineError(
+            f"Read all {len(windows)} parts of the source, but the model reported nothing "
+            f"relevant in any of them. Either the source genuinely doesn't cover this, or "
+            f"the instruction is too narrow — try rephrasing it, or switch this node to "
+            f"Relevant coverage."
+        )
+
+    combined = "\n\n".join(findings)
+    # The reduce step can itself overflow on a very long source; fall back to retrieval
+    # over the findings rather than silently truncating them.
+    if len(combined) > budget:
+        outcome = await retrieval.assemble_context(
+            source_id=f"{node.data.source_id}:findings",
+            title=title,
+            text=combined,
+            query=instruction,
+            budget_chars=budget,
+            ollama_url=engine.config.ollama_url,
+        )
+        combined = outcome.text
+
+    reduce_prompt = build_user_prompt(
+        node,
+        upstream_outputs,
+        f"<findings source=\"{title}\" parts=\"{len(windows)}\">\n{combined}\n</findings>",
+    )
+    output = await engine.generate(
+        system,
+        f"{reduce_prompt}\n\n<note>The findings above were extracted from every part of "
+        f"the source in order. Synthesise them into a single answer to the task. Do not "
+        f"mention the part numbers in your answer.</note>",
+    )
+
+    report = RetrievalReport(
+        source_id=node.data.source_id or "",
+        strategy="full",
+        used_chars=len(text),
+        total_chars=len(text),
+        chunks_used=len(windows),
+        chunks_total=len(windows),
+        note=(
+            f"Full coverage: read all {len(text):,} chars in {len(windows)} sequential "
+            f"passes, then synthesised. Nothing skipped."
+        ),
+    )
+    return output, report
+
+
 async def run_node(
     engine: Engine, node: FlowNode, upstream_outputs: list[str], store: SourceStore
 ) -> NodeResult:
@@ -692,9 +884,33 @@ async def run_node(
 
     try:
         system = build_system_prompt(node)
-        section, report = await build_source_section(
-            node, store, engine.provider, engine.config.ollama_url
-        )
+        budget = await engine_context_budget(engine)
+        source_id = (node.data.source_id or "").strip()
+        source_text = store.text(source_id) if source_id else None
+
+        # Full coverage only earns its extra calls when the source genuinely overflows.
+        wants_full = node.data.coverage == "full"
+        if wants_full and source_text and len(source_text) > budget:
+            record = store.get(source_id)
+            output, report = await run_full_coverage(
+                engine,
+                node,
+                upstream_outputs,
+                source_text,
+                record["title"] if record else "source",
+                budget,
+            )
+            return NodeResult(
+                node_id=node.id,
+                status="ok",
+                output=output,
+                provider=engine.provider,
+                model=engine.model_name,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                retrieval=[report],
+            )
+
+        section, report = await build_source_section(node, store, engine, budget)
         if report is not None:
             reports.append(report)
         prompt = build_user_prompt(node, upstream_outputs, section)
@@ -1049,6 +1265,20 @@ def _demo() -> None:
         raise AssertionError("expected an empty node to raise")
     except EngineError:
         pass
+
+    # Empty-pass detection: the sentinel appears in our own instruction, so only a reply
+    # that is essentially just the sentinel counts as empty. Anything substantive is a
+    # real finding even when it quotes the phrase back.
+    assert _is_empty_finding("")
+    assert _is_empty_finding("   ")
+    assert _is_empty_finding("NOTHING RELEVANT")
+    assert _is_empty_finding("nothing relevant.")
+    assert _is_empty_finding("  NOTHING RELEVANT  \n")
+    assert not _is_empty_finding(
+        "If this part contains nothing relevant, reply NOTHING RELEVANT. "
+        "This part discusses prompt injection at [51:20] and data poisoning at [54:02]."
+    )
+    assert not _is_empty_finding("[12:00] The speaker introduces the tokenizer.")
 
     # Persona is layered onto the node-type system prompt, not swapped for it.
     styled = build_system_prompt(FlowNode(id="a", type="copywriting", data=NodeData(persona="Wry")))

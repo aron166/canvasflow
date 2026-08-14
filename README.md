@@ -88,6 +88,37 @@ ollama pull llama3
 ollama serve    # http://localhost:11434
 ```
 
+## Long sources
+
+A one-hour video is ~78,000 characters of transcript. What happens to it depends on the
+engine's context window, and the source node reports which path ran.
+
+| Coverage | What it does | Cost |
+| --- | --- | --- |
+| **Auto** (default) | Whole source when it fits; relevant passages when it doesn't | 1 call |
+| **Relevant** | Always retrieval — passages matching this node's instruction | 1 call |
+| **Complete** | Reads every part in sequence, then synthesises. Nothing skipped | N+1 calls |
+
+Retrieval ranks passages by semantic similarity when an embedding model is installed:
+
+```bash
+ollama pull nomic-embed-text     # optional, meaningfully better than the keyword fallback
+```
+
+Without it, retrieval falls back to BM25 keyword matching, which is weaker on paraphrase
+("what did they say about pricing" vs a passage that says "costs $40/mo"). The node card
+names which one ran.
+
+### Ollama silently truncates by default
+
+Ollama's default context window is **4096 tokens**, and it discards anything beyond that
+*without an error* — the model just answers from a fragment of what you sent. CanvasFlow
+sizes `num_ctx` per request from the actual prompt, capped by the model's real limit and
+by `ollama_max_context_tokens` in Settings (default 32768).
+
+A large window costs RAM even when unused. If Ollama starts swapping or the process gets
+OOM-killed on long sources, lower that setting or use a smaller model.
+
 ## Workflow format
 
 Graphs serialize to plain JSON (`{nodes, edges}`) — export/import from the control bar,

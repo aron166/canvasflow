@@ -14,7 +14,16 @@ import type { Edge, Node } from "@xyflow/react";
 export type SourceKind = "youtube" | "webpage" | "document" | "media" | "text";
 
 /** How a source's text reached the model on the last run. */
-export type RetrievalStrategy = "whole" | "embeddings" | "keyword";
+export type RetrievalStrategy = "whole" | "embeddings" | "keyword" | "full";
+
+/**
+ * How much of an oversized source to put in front of the model.
+ *
+ * - `auto`     — whole source when it fits, relevant passages when it doesn't
+ * - `retrieve` — always passages; fastest, one model call
+ * - `full`     — read every part in sequence, then synthesise; N+1 calls, nothing skipped
+ */
+export type CoverageMode = "auto" | "retrieve" | "full";
 
 /** A resolved source, returned by `/api/sources/ingest`. */
 export interface IngestedSource {
@@ -185,6 +194,8 @@ export interface CanvasNodeData extends Record<string, unknown> {
   source?: IngestedSource;
   /** True while ingestion is in flight. */
   ingesting?: boolean;
+  /** How much of an oversized source to send. Defaults to "auto" when unset. */
+  coverage?: CoverageMode;
   /** How this source's text reached the model on the last run. */
   retrieval?: RetrievalReport;
 }
@@ -260,6 +271,7 @@ export interface FlowNodePayload {
     content?: string;
     /** Set on source nodes: the backend loads this source's text at run time. */
     source_id?: string;
+    coverage?: CoverageMode;
   };
   position?: { x: number; y: number };
 }
