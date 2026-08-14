@@ -18,20 +18,50 @@ Every node execution is routed through one of three engines, chosen in Settings:
 ## Quickstart
 
 ```bash
+./dev.sh
+```
+
+That's it. It creates the Python venv and installs both dependency sets on first run,
+then starts the API and the canvas together and prints the URLs. If port 3000 or 8000 is
+taken by another project, it moves to the next free one and tells you.
+
+<details>
+<summary>Starting the two halves manually</summary>
+
+```bash
 # 1. Backend
 cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # optional: set ANTHROPIC_API_KEY
-uvicorn main:app --reload --port 8000
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env                          # optional: set ANTHROPIC_API_KEY
+.venv/bin/uvicorn main:app --reload --port 8000
 
 # 2. Frontend (new terminal)
 cd frontend
 npm install
-npm run dev                     # http://localhost:3000
+npx next dev -p 3000
 ```
 
-Open http://localhost:3000, hit the gear icon, pick an engine, and press **Run Workflow**.
+**Use `.venv/bin/uvicorn`, not plain `uvicorn`.** If a system-wide uvicorn is installed,
+a bare `uvicorn main:app` runs under the system Python, which cannot see anything in the
+venv — it fails with `ModuleNotFoundError: No module named 'dotenv'` even though the
+package is definitely installed. Activating the venv first (`source .venv/bin/activate`)
+works too.
+
+**Check the port actually belongs to CanvasFlow.** If something else is already serving
+on 3000, Next moves to 3001 and prints it — but a browser tab left open on 3000 will show
+that other app instead, which looks like CanvasFlow rendering without styles. The page
+title should read *CanvasFlow*.
+
+If the frontend can't reach the backend, point it explicitly:
+
+```bash
+NEXT_PUBLIC_CANVASFLOW_API=http://localhost:8000 npx next dev -p 3000
+```
+
+</details>
+
+Then hit the engine button in the bottom bar, pick an engine, and press **Run Workflow**.
 
 ### Engine-specific setup
 
