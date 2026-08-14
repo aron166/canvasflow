@@ -1,0 +1,23 @@
+# deps
+node_modules/
+.pnp
+.venv/
+__pycache__/
+*.py[cod]
+
+# next
+.next/
+out/
+build/
+
+# env
+.env
+.env.local
+*.local
+
+# misc
+.DS_Store
+*.log
+.vercel
+*.tsbuildinfo
+next-env.d.ts
