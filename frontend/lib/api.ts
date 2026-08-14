@@ -7,6 +7,7 @@ import type {
   EngineStatus,
   FlowEdgePayload,
   FlowNodePayload,
+  IngestedSource,
   NodeResult,
   WorkflowResponse,
 } from "@/types";
@@ -17,14 +18,10 @@ const API_BASE =
 /** Raised for anything that stops a request from returning a usable body. */
 export class ApiError extends Error {}
 
-async function post<T>(path: string, body: unknown): Promise<T> {
+async function send<T>(path: string, init: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    response = await fetch(`${API_BASE}${path}`, init);
   } catch {
     throw new ApiError(
       `Cannot reach the CanvasFlow backend at ${API_BASE}. Start it with ` +
@@ -45,7 +42,17 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     throw new ApiError(`Backend returned ${response.status}: ${detail.slice(0, 400)}`);
   }
 
-  return (await response.json()) as T;
+  // DELETE answers 204 with no body, so an unconditional .json() would throw.
+  const text = await response.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+function post<T>(path: string, body: unknown): Promise<T> {
+  return send<T>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 /** Strip React Flow internals so the backend only sees what it needs. */
@@ -58,6 +65,7 @@ export function toNodePayload(node: CanvasNode): FlowNodePayload {
       prompt: node.data.prompt,
       persona: node.data.persona,
       content: node.data.content,
+      source_id: node.data.source?.source_id,
     },
     position: node.position,
   };
@@ -93,4 +101,21 @@ export function executeNode(
 
 export function probeEngine(engine: EngineConfig): Promise<EngineStatus> {
   return post<EngineStatus>("/api/engine/status", engine);
+}
+
+/* ------------------------------------------------------------------- sources */
+
+export function ingestUrl(url: string): Promise<IngestedSource> {
+  return post<IngestedSource>("/api/sources/ingest", { url });
+}
+
+export function ingestFile(file: File): Promise<IngestedSource> {
+  const form = new FormData();
+  form.append("file", file);
+  // No Content-Type header — only the browser can add the multipart boundary.
+  return send<IngestedSource>("/api/sources/upload", { method: "POST", body: form });
+}
+
+export function deleteSource(sourceId: string): Promise<void> {
+  return send<void>(`/api/sources/${encodeURIComponent(sourceId)}`, { method: "DELETE" });
 }

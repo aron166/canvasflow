@@ -8,6 +8,53 @@
 
 import type { Edge, Node } from "@xyflow/react";
 
+/* --------------------------------------------------------------------- Sources */
+
+/** What a source node ingested. Mirrors `SourceKind` in backend/ingest.py. */
+export type SourceKind = "youtube" | "webpage" | "document" | "media" | "text";
+
+/** How a source's text reached the model on the last run. */
+export type RetrievalStrategy = "whole" | "embeddings" | "keyword";
+
+/** A resolved source, returned by `/api/sources/ingest`. */
+export interface IngestedSource {
+  source_id: string;
+  kind: SourceKind;
+  title: string;
+  origin: string;
+  char_count: number;
+  /** First ~1200 chars, for the node card preview. */
+  preview: string;
+  meta: {
+    duration_label?: string;
+    pages?: number;
+    site?: string;
+    format?: string;
+    whisper_model?: string;
+    video_id?: string;
+  };
+}
+
+/** Per-source report of how context was assembled, surfaced on the node card. */
+export interface RetrievalReport {
+  source_id: string;
+  strategy: RetrievalStrategy;
+  used_chars: number;
+  total_chars: number;
+  chunks_used: number;
+  chunks_total: number;
+  note: string;
+}
+
+/** Human-readable label per source kind, for node headers and the add menu. */
+export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+  youtube: "YouTube",
+  webpage: "Web page",
+  document: "Document",
+  media: "Audio / video",
+  text: "Pasted text",
+};
+
 /* ------------------------------------------------------------------ AI engines */
 
 /** The three interchangeable execution backends. */
@@ -99,6 +146,7 @@ export const ENGINE_DESCRIPTORS: readonly EngineDescriptor[] = [
 
 /** Node kinds the canvas can render. Each maps to a system prompt on the backend. */
 export type CanvasNodeType =
+  | "sourceNode"
   | "campaignInput"
   | "copywriting"
   | "videoScript"
@@ -129,6 +177,16 @@ export interface CanvasNodeData extends Record<string, unknown> {
   status?: NodeRunStatus;
   error?: string;
   durationMs?: number;
+
+  /* -- source nodes only -------------------------------------------------- */
+  /** The URL the user pasted, before ingestion. */
+  url?: string;
+  /** Set once ingestion succeeds; its `source_id` is what execution references. */
+  source?: IngestedSource;
+  /** True while ingestion is in flight. */
+  ingesting?: boolean;
+  /** How this source's text reached the model on the last run. */
+  retrieval?: RetrievalReport;
 }
 
 /** A React Flow node narrowed to CanvasFlow's data shape. */
@@ -137,6 +195,8 @@ export type CanvasEdge = Edge;
 
 /** Persona options offered per node type, surfaced as the node's dropdown. */
 export const NODE_PERSONAS: Record<CanvasNodeType, readonly string[]> = {
+  // A source node ingests rather than generates, so it has no persona.
+  sourceNode: [],
   campaignInput: [
     "Growth strategist",
     "Brand planner",
@@ -198,6 +258,8 @@ export interface FlowNodePayload {
     prompt: string;
     persona?: string;
     content?: string;
+    /** Set on source nodes: the backend loads this source's text at run time. */
+    source_id?: string;
   };
   position?: { x: number; y: number };
 }
@@ -228,6 +290,8 @@ export interface NodeResult {
   provider?: EngineProvider | null;
   model?: string | null;
   duration_ms: number;
+  /** Present when this node consumed sources; one entry per source used. */
+  retrieval?: RetrievalReport[] | null;
 }
 
 export interface WorkflowResponse {
