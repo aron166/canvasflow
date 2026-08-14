@@ -728,9 +728,21 @@ app = FastAPI(
     description="Graph execution service with a swappable 3-way AI backend.",
 )
 
+# Any localhost port, not just 3000. The frontend moves to 3001+ whenever another
+# project holds 3000, and a hardcoded origin turns that into a CORS rejection that the
+# browser reports to the app as an unreachable server — a misleading symptom for what is
+# really a config mismatch.
+#
+# Loopback only: this still refuses every remote origin. Set CANVASFLOW_ALLOWED_ORIGINS
+# to an explicit comma-separated list when deploying anywhere real.
+LOCALHOST_ORIGIN_PATTERN = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+
+_explicit_origins = os.getenv("CANVASFLOW_ALLOWED_ORIGINS", "").strip()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CANVASFLOW_ALLOWED_ORIGINS", "http://localhost:3000").split(","),
+    allow_origins=[o.strip() for o in _explicit_origins.split(",") if o.strip()],
+    allow_origin_regex=None if _explicit_origins else LOCALHOST_ORIGIN_PATTERN,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
